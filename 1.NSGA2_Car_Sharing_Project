@@ -1,0 +1,397 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import math
+import random
+import sys
+from tqdm.notebook import tqdm
+
+class Population:
+    ''' pouplation comprises all solutions
+        group solutions with same rank to form a front
+        e.g., fronts[0] comprises a list of soltuions in first non-dominated rank, that dominates all the other solutions
+    '''
+    def __init__(self):
+        self.population = []
+        self.fronts = []
+
+    def __len__(self):
+        return len(self.population)
+
+    def __iter__(self):
+        return self.population.__iter__()
+
+    def extend(self, new_solutions):
+        self.population.extend(new_solutions)
+
+    def append(self, new_solution):
+        self.population.append(new_solution)
+
+    def show_sols_in_population(self):
+        for sol in self.population:
+            attributes = []
+            #attributes.append(sol.decision_variables)
+            attributes.append(sol.objectives)
+            attributes.append(sol.front_rank)
+            attributes.append(sol.crowding_distance)
+            attributes.append(sol.grc_crowding)
+            print (attributes)
+
+    def show_sols_in_fronts(self):
+        for front in self.fronts:
+            for sol in front:
+                attributes = []
+                #attributes.append(sol.decision_variables)
+                attributes.append(sol.objectives)
+                attributes.append(sol.front_rank)
+                attributes.append(sol.crowding_distance)
+                attributes.append(sol.grc_crowding)
+                print (attributes)
+
+class NSGA_II_Core:
+    '''The core functions of NSGA-II algo, e.g., non-dominated front rank, crowding distance, crossover, mutation etc.'''
+    def __init__(self, problem,
+                 num_solutions=100,
+                 tournament_solutions=2,
+                 tournament_probability=0.9,
+                 crossover_constant=2,
+                 mutation_constant=5):
+        self.problem = problem
+        self.num_solutions = num_solutions
+        self.tournament_solutions = tournament_solutions
+        self.tournament_probability = tournament_probability
+        self.crossover_constant = crossover_constant
+        self.mutation_constant = mutation_constant
+
+    def initialize_population(self):
+        '''Intially, generate the first batch of solutions'''
+        population = Population()
+        for _ in range(self.num_solutions):
+            solution = self.problem.create_solution()
+            self.problem.objectives_val_calc(solution)
+            population.append(solution)
+        return population
+
+    def find_nondominated_front_rank(self, population):
+        '''Find non-dominated rank for all solution in the population; Group solutions with same rank to form a front'''
+        population.fronts = [[]]
+        for solution in population:
+            solution.dominated_by_count = 0
+            solution.dominating_to_sols = []
+            for other_solution in population:
+                if solution.dominates(other_solution):
+                    solution.dominating_to_sols.append(other_solution)
+                elif other_solution.dominates(solution):
+                    solution.dominated_by_count += 1
+            if solution.dominated_by_count == 0:
+                solution.front_rank = 0     #non-dominated top rank
+                population.fronts[0].append(solution) #solutions of top rank --> top front
+        i = 0
+        while len(population.fronts[i]) > 0:
+            sol_lst = []
+            for solution in population.fronts[i]:
+                for other_solution in solution.dominating_to_sols:
+                    other_solution.dominated_by_count -= 1
+                    if other_solution.dominated_by_count == 0:
+                        other_solution.front_rank = i+1
+                        sol_lst.append(other_solution)
+            i = i+1
+            population.fronts.append(sol_lst)
+        del population.fronts[-1] #last list appended is always empty from the while loop above. Delete it
+
+    def find_crowding_distance(self, front):
+        '''get crowding distance of each solution in the front'''
+        if len(front) > 0:
+            for solution in front:
+                solution.crowding_distance = 0 #initial dist value
+            num_sols_m = len(front)               #m solutions
+            num_objs_n = len(front[0].objectives) #n objectives
+            for j in range(num_objs_n):
+                front.sort(key=lambda solution: solution.objectives[j])
+                front[0].crowding_distance = sys.maxsize                               #inf
+                front[num_sols_m-1].crowding_distance = sys.maxsize                    #inf
+                obj_m_values = [solution.objectives[j] for solution in front]          #m solutions
+                scale = max(obj_m_values) - min(obj_m_values)
+                if scale == 0:
+                    scale = 1
+                for i in range(1, num_sols_m-1):
+                    front[i].crowding_distance += (front[i+1].objectives[j] - front[i-1].objectives[j])/scale
+
+    def find_grc_crowding(self, front):
+        if len(front) > 0:
+            all_sols = []
+            idx_inf_end = None
+            for idx, sol in enumerate(front):
+                sol_obj_cd_value = []
+                if sol.crowding_distance != sys.maxsize:
+                    sol_obj_cd_value.extend(sol.objectives)
+                    sol_obj_cd_value.append(sol.crowding_distance)
+                    all_sols.append(sol_obj_cd_value)
+                else:
+                    idx_inf_end = idx
+            
+            obj_cd_max = [None] * 3 
+            obj_cd_min = [None] * 3
+            for sol in all_sols:
+                for j, val in enumerate(sol):
+                    if obj_cd_max[j] is None or val >= obj_cd_max[j]:
+                        obj_cd_max[j] = val
+                    if obj_cd_min[j] is None or val <= obj_cd_min[j]:
+                        obj_cd_min[j] = val
+            
+            for sol in all_sols:
+                for j, val in enumerate(sol):
+                    if j == len(sol) - 1: #temp for crowding dist, need to change to max/min check later
+                        sol[j] = (val - obj_cd_min[j])/(obj_cd_max[j] - obj_cd_min[j])
+                    else:
+                        sol[j] = (obj_cd_max[j] - val)/(obj_cd_max[j] - obj_cd_min[j])
+            
+            obj_reference = [None] * 3
+            for sol in all_sols:
+                for j, val in enumerate(sol):
+                    if obj_reference[j] is None or val >= obj_reference[j]:
+                        obj_reference[j] = val
+            
+            for sol in all_sols:
+                for j, val in enumerate(sol):
+                    sol[j] = abs(obj_reference[j] - sol[j])
+            
+            delta_max = None
+            delta_min = None
+            for sol in all_sols:
+                for j, val in enumerate(sol):
+                    if delta_max is None or val >= delta_max:
+                        delta_max = val
+                    if delta_min is None or val <= delta_min:
+                        delta_min = val
+            
+            grc_cd_score = []
+            for sol in all_sols:
+                temp_sum = 0
+                for j, val in enumerate(sol):
+                    temp_sum += (delta_min + delta_max)/(val + delta_max)
+                grc_cd_score.append((1/len(sol)) * temp_sum)
+            
+            for i in range(idx_inf_end+1, len(front)):
+                front[i].grc_crowding = grc_cd_score[i-(idx_inf_end+1)]
+            
+            for i in range(0, idx_inf_end+1):
+                front[i].grc_crowding = sys.maxsize
+                
+#             for idx, sol in enumerate(front):
+#                 print(sol.grc_crowding)
+
+
+    def generate_child_sols(self, population):
+        '''Create same number of child solutions as that of the initial solutions, i.e., double the population size'''
+        child_sols = []
+        father_sol = None
+        mother_sol = None
+        while len(child_sols) < len(population):
+            father_sol = self.__pick_sol_tournament(population)
+            mother_sol = father_sol
+            while father_sol == mother_sol:
+                mother_sol = self.__pick_sol_tournament(population)
+            child1, child2 = self.__crossover(father_sol, mother_sol)
+            self.__mutate(child1)
+            self.__mutate(child2)
+            if (self.problem.is_sol_pass_constraint(child1) and self.problem.is_sol_pass_constraint(child2)):
+                self.problem.objectives_val_calc(child1)
+                self.problem.objectives_val_calc(child2)
+                child_sols.append(child1)
+                child_sols.append(child2)
+        return child_sols
+
+    def __crossover(self, father_sol, mother_sol):
+        '''To crossover parent solutions' DV and create 2 child solutions' DV'''
+        child1 = self.problem.create_solution()
+        child2 = self.problem.create_solution()
+        num_of_decision_variables = len(child1.decision_variables)
+        for i in range(num_of_decision_variables):
+            rdm = random.random()
+            beta = (2*rdm)**(1/(self.crossover_constant+1))
+            if rdm > 0.5:
+                beta = (2*(1-rdm))**(-1/(self.crossover_constant+1))
+            x1 = (father_sol.decision_variables[i] + mother_sol.decision_variables[i])/2
+            x2 = abs((father_sol.decision_variables[i] - mother_sol.decision_variables[i])/2)
+            child1.decision_variables[i] = x1 + beta*x2
+            child2.decision_variables[i] = x1 - beta*x2
+#             print("dv ", i, " rdm ", rdm, " beta ", beta, " x1 ", x1, " x2 ", x2, " father_sol.decision_variables[i] ",
+#                  father_sol.decision_variables[i], " mother_sol.decision_variables[i] " ,mother_sol.decision_variables[i])
+#         print("father_sol: ", father_sol.decision_variables)
+#         print("mother_sol: ", mother_sol.decision_variables)
+#         print("child1 after crossover: ", child1.decision_variables)
+#         print("child1 after crossover: ", child2.decision_variables)
+        return child1, child2
+
+    def __mutate(self, child):
+        '''To mutate a solution's DV '''
+#         print("b4 mutate: ", child.decision_variables)
+        num_of_decision_variables = len(child.decision_variables)
+        for g in range(num_of_decision_variables): #for each variable/gene(g)
+            rdm = random.random()
+            if rdm < 0.5:
+                delta = (2*rdm)**(1/(self.mutation_constant + 1)) - 1
+                child.decision_variables[g] += delta*(child.decision_variables[g] - self.problem.variables_range[g][0])
+            else:
+                delta = 1 - (2*(1-rdm))**(1/(self.mutation_constant + 1))
+                child.decision_variables[g] += delta*(self.problem.variables_range[g][1] - child.decision_variables[g])
+
+            if child.decision_variables[g] < self.problem.variables_range[g][0]:       #lower bound
+                child.decision_variables[g] = self.problem.variables_range[g][0]
+            elif child.decision_variables[g] > self.problem.variables_range[g][1]:     #upper bound
+                child.decision_variables[g] = self.problem.variables_range[g][1]
+#         print("af mutate: ", child.decision_variables)
+
+    def __is_outperform_best(self, solution, best_solution):
+        ''' Check if a solution outperforms the best_solution found so far
+            The smaller the rank (i.e., front),the better; The bigger the crowding_distance, the better. 
+        '''
+        if (solution.front_rank < best_solution.front_rank) or \
+            ((solution.front_rank == best_solution.front_rank) and (solution.crowding_distance > best_solution.crowding_distance)):
+            return True
+        else:
+            return False
+
+    def __pick_sol_tournament(self, population):
+        '''Pick one solution randomly, for the tournament of crossover to generate child solutions'''
+        participants = random.sample(population.population, self.tournament_solutions)
+        best = None
+        for participant in participants:
+            if best is None or (self.__is_outperform_best(participant, best) and random.random() <= self.tournament_probability):
+                best = participant
+        return best
+
+class Solution(object):
+    '''Representing a solution, that has decision varibles, objectives value, front_rank etc.'''
+    def __init__(self):
+        self.front_rank = None
+        self.crowding_distance = None
+        self.grc_crowding = None #try to explore GRA + crowding for cut-off front sols selection
+        self.dominated_by_count = None #been dominated by how many sols
+        self.dominating_to_sols = None #The sols list that it dominates to
+        self.decision_variables = None #decision variables value list
+        self.objectives = None #objectives value list for one particular solution
+        self.objs_optimization_type = None
+
+    def __eq__(self, other):
+        if isinstance(self, other.__class__):
+            return self.decision_variables == other.decision_variables
+        return False
+
+    def dominates(self, other_solution): #condition for one solution dominates another solution
+        first_and = True
+        second_or = False
+        for j, (self_j_val, other_j_val) in enumerate(zip(self.objectives, other_solution.objectives)):
+            if (self.objs_optimization_type[j] == 'Min'):   #the smaller the better -> minimization
+                first_and = first_and and self_j_val <= other_j_val
+                second_or = second_or or self_j_val < other_j_val
+            elif (self.objs_optimization_type[j] == 'Max'): #the larger the better -> maximization
+                first_and = first_and and self_j_val >= other_j_val
+                second_or = second_or or self_j_val > other_j_val
+            else:
+                raise Exception("Sorry, optimization type is not proper, pls use 'Max' or 'Min'.")
+        return (first_and and second_or)
+
+
+class Evolution:
+    def __init__(self, problem,
+                 num_of_generations=1000,
+                 num_solutions=100,
+                 tournament_solutions=2,
+                 tournament_probability=0.9,
+                 crossover_constant=2,
+                 mutation_constant=5):
+        self.nsga_obj = NSGA_II_Core(problem, num_solutions, tournament_solutions, tournament_probability, crossover_constant, mutation_constant)
+        self.population = None
+        self.num_of_generations = num_of_generations
+        self.num_solutions = num_solutions
+
+    def evolve(self):
+        self.population = self.nsga_obj.initialize_population()
+#         print('\ninitialize') #
+#         self.population.show_sols_in_population() #
+        
+        self.nsga_obj.find_nondominated_front_rank(self.population)
+        for front in self.population.fronts:
+            self.nsga_obj.find_crowding_distance(front)
+            
+#         print('\nFind rank and crowding distance') #
+#         self.population.show_sols_in_fronts() #
+
+        child_sols = self.nsga_obj.generate_child_sols(self.population)
+
+        final_population = None
+        for i in tqdm(range(self.num_of_generations)):
+            #Start of one complete evolution
+            self.population.extend(child_sols) #parent + child sols
+            self.nsga_obj.find_nondominated_front_rank(self.population) #re-find front_rank for parent + child sols
+            evolved_population = Population() #from parent + child sols, find the top (e.g., 100) sols
+            front_rank = 0
+            while len(evolved_population) + len(self.population.fronts[front_rank]) <= self.num_solutions:
+                self.nsga_obj.find_crowding_distance(self.population.fronts[front_rank])
+                evolved_population.extend(self.population.fronts[front_rank])
+                front_rank += 1
+            self.nsga_obj.find_crowding_distance(self.population.fronts[front_rank])
+            self.population.fronts[front_rank].sort(key=lambda solution: solution.crowding_distance, reverse=True) #large crowding dist --> small
+            
+#             print('\nAdded child solutions and show crowding_distance') #
+#             self.population.show_sols_in_fronts() #
+            if integrate_grc:
+                self.nsga_obj.find_grc_crowding(self.population.fronts[front_rank])#
+                self.population.fronts[front_rank].sort(key=lambda solution: solution.grc_crowding, reverse=True) #large grc_crowding --> small
+            
+#             print('\nAdded child solutions and show grc_crowding for cut-off front') #
+#             self.population.show_sols_in_fronts() #
+                        
+            evolved_population.extend(self.population.fronts[front_rank][0:self.num_solutions-len(evolved_population)])
+
+            self.population = evolved_population
+            #print('\nOnly kept same number sols') #
+            #self.population.show_sols_in_population() #
+            #End of one complete evolution
+
+            self.nsga_obj.find_nondominated_front_rank(self.population)
+            for front in self.population.fronts:
+                self.nsga_obj.find_crowding_distance(front)
+            #print('\nOnly kept same number sols and sort') #
+            #self.population.show_sols_in_population() #
+            child_sols = self.nsga_obj.generate_child_sols(self.population)
+
+            if (i == self.num_of_generations - 1):
+                final_population = evolved_population
+        return final_population.fronts[0]
+
+
+class MOO_Problem:
+    def __init__(self, variables_range, objectives_func, objectives_type, constraints_func):
+        self.variables_range = variables_range
+        self.objectives_func = objectives_func
+        self.objectives_type = objectives_type
+        self.num_of_objectives = len(objectives_func)
+        self.constraints_func = constraints_func
+
+    def create_solution(self):
+        solution = Solution()
+        while((solution.decision_variables == None) or (not self.is_sol_pass_constraint(solution))):
+            variables_val_lst = []
+            for x in self.variables_range:
+                variables_val_lst.append(random.uniform(*x))
+            solution.decision_variables = variables_val_lst
+        solution.objs_optimization_type = self.objectives_type
+        return solution
+
+    def is_sol_pass_constraint(self, solution):
+        '''Check if a solution passing the constraint conditions'''
+        if not self.constraints_func:
+            return True #in case no constraint functions, simply return a true
+        constraint_pass = True
+        constraint_pf_lst = []
+        for g in self.constraints_func:
+            if(g(solution.decision_variables)):
+                continue
+            else:
+                return False #one fail, all fail
+        return constraint_pass
+
+    def objectives_val_calc(self, solution):
+            solution.objectives = [f(solution.decision_variables) for f in self.objectives_func]
